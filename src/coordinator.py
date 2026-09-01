@@ -7,13 +7,10 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .state import create_logger, LOG_LEVEL
 from .schedule import load_schedule_info
+from .device import is_cuda
 
 
-# Coordinator needs GPUs when using profiling to infer stage boundaries
-# @ray.remote(num_gpus=0.1)
-
-# Use manual stage annotations- more stable
-@ray.remote(num_gpus=0.1)
+@ray.remote
 def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callable, *args, **kwargs):
     logger = create_logger("coordinator", LOG_LEVEL)
     logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
@@ -65,16 +62,27 @@ class PiperProgramCoordinator:
             logger.exception("Failed to kill stale Ray actor named %s", _COMPILED_DATA_ACTOR)
             raise
 
-        return ray.get(
-            [
-                run_dp_rank.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=(
-                            dp_rank % self.pp_degree if self.pp_outer else dp_rank
-                        ),
-                    )
-                ).remote(
+        run_options: dict = {}
+        if is_cuda():
+            run_options["num_gpus"] = 0.1
+        if pg is not None:
+            run_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=0,
+            )
+
+        refs = []
+        for dp_rank in range(self.dp_degree):
+            dp_options = dict(run_options)
+            if pg is not None:
+                dp_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=(
+                        dp_rank % self.pp_degree if self.pp_outer else dp_rank
+                    ),
+                )
+            refs.append(
+                run_dp_rank.options(**dp_options).remote(
                     dp_rank,
                     self.dp_degree,
                     self.pp_degree,
@@ -83,24 +91,26 @@ class PiperProgramCoordinator:
                     *args,
                     **kwargs,
                 )
-                for dp_rank in range(self.dp_degree)
-            ]
-        )
+            )
+        return ray.get(refs)
 
 
 def create_piper_placement_group(schedule_directives_file: str, pp_outer: bool = False):
     info = load_schedule_info(schedule_directives_file)
     pp_degree = info["pp_degree"]
     dp_degree = info["dp_degree"]
+    cuda = is_cuda()
 
-    if pp_outer:
+    if pp_outer and cuda:
         drivers_per_bundle = (dp_degree + pp_degree - 1) // pp_degree
-        return placement_group(
-            [{"CPU": dp_degree + drivers_per_bundle, "GPU": dp_degree}] * pp_degree,
-            strategy="STRICT_SPREAD",
-        )
+        bundle = {"CPU": dp_degree + drivers_per_bundle, "GPU": dp_degree}
+        num_bundles = pp_degree
+        strategy = "STRICT_SPREAD"
+    else:
+        bundle = {"CPU": max(pp_degree, 1)}
+        if cuda:
+            bundle["GPU"] = pp_degree
+        num_bundles = dp_degree
+        strategy = "SPREAD"
 
-    return placement_group(
-        [{"CPU": pp_degree, "GPU": pp_degree}] * dp_degree,
-        strategy="SPREAD",
-    )
+    return placement_group([bundle] * num_bundles, strategy=strategy)
