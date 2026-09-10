@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +14,37 @@ from torch.nn import Parameter
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
+
+
+def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
+    """Raise or sleep if a PIPER_FAULT spec matches this execution point.
+
+    pass_name: "bwd" or "upd".
+    iter_count: 0-based run_dag iteration counter (warmup iterations count).
+    dp_rank: this actor's DP rank.
+
+    Spec format: "<pass>:<iter>:<dp_rank>[:sleep:<s>]", comma-separated.
+    """
+    specs = os.environ.get("PIPER_FAULT")
+    if not specs:
+        return
+    for spec in specs.split(","):
+        parts = spec.split(":")
+        if parts[:3] != [pass_name, str(iter_count), str(dp_rank)]:
+            continue
+        # One BWD node per annotated segment — latch to fire once per iteration.
+        key = (spec, iter_count)
+        if key in _FIRED_FAULTS:
+            continue
+        _FIRED_FAULTS.add(key)
+        print(f"PIPER_FAULT firing: {spec}", flush=True)
+        if len(parts) >= 5 and parts[3] == "sleep":
+            time.sleep(float(parts[4]))
+            continue
+        raise RuntimeError(f"injected fault ({spec})")
+
+
+_FIRED_FAULTS: set = set()
 
 
 @dataclass
@@ -454,6 +487,9 @@ class DagExecutor:
     communication: CommunicationExecutor
     compute: ComputeExecutor
     logger: Any
+    # 0-based iteration counter, set by PiperActor.run_dag each call.
+    # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
+    _iter_count: int = 0
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
@@ -554,6 +590,7 @@ class DagExecutor:
         self.params.zero_grad_buffers(default_stream)
         zero_evt = torch.cuda.Event()
         zero_evt.record(default_stream)
+        step_result = None
         for stream in self.runtime.streams.values():
             if stream is not default_stream:
                 stream.wait_event(zero_evt)
@@ -737,6 +774,7 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD:
+                    _maybe_inject_fault("bwd", self._iter_count, self.runtime.dp_rank)
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
@@ -760,6 +798,7 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -956,26 +995,29 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(node_stream, loss_buffer)
+                    step_result = self._update(node_stream, loss_buffer)
 
                 case TaskType.ORDER_DUMMY:
                     pass
 
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
+        return step_result
 
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
+            _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
-            losses = loss_buffer
+            losses = list(loss_buffer)
             loss_buffer.clear()
             torch.cuda.synchronize()
-            return losses
+            return [float(l) for l in losses]
 
         for ar_evt in self.events.all_reduce.values():
             stream.wait_event(ar_evt)
 
+        _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
@@ -986,11 +1028,11 @@ class DagExecutor:
             with torch.cuda.stream(stream):
                 bucket.optimizer.step()
 
-        losses = loss_buffer
+        losses = list(loss_buffer)
         loss_buffer.clear()
 
         torch.cuda.synchronize()
 
         return {
-            "losses": losses,
+            "losses": [float(l) for l in losses],
         }
