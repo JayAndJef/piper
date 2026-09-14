@@ -64,6 +64,9 @@ class PiperProgramCoordinator:
 
         run_options: dict = {}
         if is_cuda():
+            # Coordinator needs GPUs when using profiling to infer stage
+            # boundaries, if manual stage annotations are not being used.
+			# TODO(swang): Is this necessary?
             run_options["num_gpus"] = 0.1
         if pg is not None:
             run_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
