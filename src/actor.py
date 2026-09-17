@@ -17,7 +17,7 @@ from .state import (
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
 from .executors import CommunicationExecutor, ComputeExecutor, DagExecutor
 from .ordering import _serial_topological_order
-from .device import is_cuda
+from .device import get_device
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import training_dag_task_type as _training_dag_task_type
 
@@ -78,9 +78,11 @@ def _create_actors(
         # all PP ranks (shape is [{"GPU": pp}] * dp).
         bundle_index = pp_rank if pp_outer else dp_rank
         actor_options = {
-            "num_gpus": 0.6 if is_cuda() else 0,
             "runtime_env": {**nsight_env, **nccl_env},
         }
+        accel = get_device().accelerator_resource
+        if accel == "GPU":
+            actor_options["num_gpus"] = 0.6
         if pg is not None:
             actor_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -180,16 +182,13 @@ class PiperActor:
 
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
-        if is_cuda():
-            max_alloc = torch.cuda.max_memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-        else:
+        max_alloc = get_device().get_and_reset_peak_memory()
+        if max_alloc is None:
             max_alloc = 0
         return self.runtime.global_rank, max_alloc
 
     def reset_peak_memory(self):
-        if is_cuda():
-            torch.cuda.reset_peak_memory_stats()
+        get_device().reset_peak_memory()
 
     def _nvtx_push(self, label: str) -> None:
         self.runtime.nvtx_push(label)
@@ -204,9 +203,7 @@ class PiperActor:
         labelled the same as its NVTX range, so the resulting trace identifies
         per-node work.
         """
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if is_cuda():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        activities = get_device().profiler_activities()
         self.runtime.torch_profiler = torch.profiler.profile(
             activities=activities,
         )
@@ -263,13 +260,9 @@ class PiperActor:
 
         init_method = f"tcp://{master_addr}:{master_port}"
 
-        if is_cuda():
-            self.runtime.device = f"cuda:{self.runtime.global_rank % torch.cuda.device_count()}"
-            torch.cuda.set_device(self.runtime.device)
-            dist_backend = "nccl"
-        else:
-            self.runtime.device = "cpu"
-            dist_backend = "gloo"
+        dev = get_device()
+        self.runtime.device = dev.set_device(self.runtime.global_rank)
+        dist_backend = dev.dist_backend
 
         if self.runtime.pp_degree > 1 or self.runtime.dp_degree > 1:
             dist.init_process_group(
@@ -287,7 +280,7 @@ class PiperActor:
             self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
     def _join_dp_process_group(self):
-        dist_backend = "nccl" if is_cuda() else "gloo"
+        dist_backend = get_device().dist_backend
         num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
         for dp_group_id in range(num_dp_groups):
             group_ranks = [
@@ -303,7 +296,7 @@ class PiperActor:
                 self.runtime.ep_group = ep_process_group
 
     def _join_pp_process_group(self):
-        dist_backend = "nccl" if is_cuda() else "gloo"
+        dist_backend = get_device().dist_backend
         num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
 
         for pp_group_id in range(num_pp_groups):
@@ -621,7 +614,7 @@ class PiperActor:
                 bucket.param_shard_info = None
                 bucket.full_params_fresh = False
                 trainable_for_optim = [realized[i] for i in trainable_idxs]
-                optim = self.optim_class(trainable_for_optim, fused=is_cuda()) if trainable_for_optim else None
+                optim = self.optim_class(trainable_for_optim) if trainable_for_optim else None
             bucket.optimizer = optim
 
         # Keep first GraphModule for compatibility with external inspection tools.
@@ -759,8 +752,10 @@ class PiperActor:
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
+        # Debug-only: expose the iteration counter for E2E fault injection.
+        self.dag_executor._iter_count = iter_idx
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
-        self.dag_executor.run(
+        result = self.dag_executor.run(
             self.dag,
             self.sorted_dag_nodes,
             self.inputs,
@@ -769,3 +764,4 @@ class PiperActor:
             loss_fn=loss_fn,
         )
         self._nvtx_pop()
+        return result

@@ -1,13 +1,14 @@
+import os
+
 import ray
 from typing import Callable
-import os
 
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .state import create_logger, LOG_LEVEL
 from .schedule import load_schedule_info
-from .device import is_cuda
+from .device import get_device
 
 
 @ray.remote
@@ -63,10 +64,11 @@ class PiperProgramCoordinator:
             raise
 
         run_options: dict = {}
-        if is_cuda():
+        accel = get_device().accelerator_resource
+        if accel == "GPU":
             # Coordinator needs GPUs when using profiling to infer stage
             # boundaries, if manual stage annotations are not being used.
-			# TODO(swang): Is this necessary?
+            # TODO(swang): Is this necessary?
             run_options["num_gpus"] = 0.1
         if pg is not None:
             run_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
@@ -102,17 +104,18 @@ def create_piper_placement_group(schedule_directives_file: str, pp_outer: bool =
     info = load_schedule_info(schedule_directives_file)
     pp_degree = info["pp_degree"]
     dp_degree = info["dp_degree"]
-    cuda = is_cuda()
 
-    if pp_outer and cuda:
+    accel = get_device().accelerator_resource
+
+    if pp_outer and accel is not None:
         drivers_per_bundle = (dp_degree + pp_degree - 1) // pp_degree
-        bundle = {"CPU": dp_degree + drivers_per_bundle, "GPU": dp_degree}
+        bundle = {"CPU": dp_degree + drivers_per_bundle, accel: dp_degree}
         num_bundles = pp_degree
         strategy = "STRICT_SPREAD"
     else:
         bundle = {"CPU": max(pp_degree, 1)}
-        if cuda:
-            bundle["GPU"] = pp_degree
+        if accel is not None:
+            bundle[accel] = pp_degree
         num_bundles = dp_degree
         strategy = "SPREAD"
 

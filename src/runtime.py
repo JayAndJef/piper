@@ -8,9 +8,7 @@ import torch
 import torch.distributed as dist
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from .device import (
-    create_stream_context, is_cuda, wait_event,
-)
+from .device import get_device
 
 
 @dataclass
@@ -170,18 +168,11 @@ class RuntimeState:
             if getattr(n, "stream", None) is not None
         }
         stream_ids.add("default_stream")
+        dev = get_device()
         self.streams = {
-            stream_id: create_stream_context(self.device)
+            stream_id: dev.create_stream_context()
             for stream_id in sorted(stream_ids)
         }
-
-        # Force cuBLAS context initialization on every logical stream used by
-        # this DAG so the first backward pass does not hit lazy CUDA warnings.
-        if is_cuda():
-            for stream_ctx in self.streams.values():
-                with stream_ctx:
-                    w = torch.zeros(4, 4, device=self.device)
-                    torch.mm(w, w)
 
     def stream_for_id(self, stream_id: str) -> AbstractContextManager:
         assert stream_id in self.streams, (
@@ -197,12 +188,12 @@ class RuntimeState:
         return self.stream_for_id("default_stream")
 
     def nvtx_push(self, label: str) -> None:
-        if not self.no_nvtx and is_cuda():
-            torch.cuda.nvtx.range_push(label)
+        if not self.no_nvtx:
+            get_device().nvtx_push(label)
 
     def nvtx_pop(self) -> None:
-        if not self.no_nvtx and is_cuda():
-            torch.cuda.nvtx.range_pop()
+        if not self.no_nvtx:
+            get_device().nvtx_pop()
 
 
 @dataclass
@@ -464,8 +455,9 @@ class ParamStorage:
         stream_ctx: AbstractContextManager,
         reduce_scatter_events: dict[Any, Any],
     ) -> None:
+        dev = get_device()
         for evt in reduce_scatter_events.values():
-            wait_event(stream_ctx, evt)
+            dev.wait_event(stream_ctx, evt)
 
         for bucket in self.stages.buckets.values():
             shard_optim = bucket.shard_optimizer

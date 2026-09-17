@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
@@ -11,9 +13,40 @@ from torch.autograd.graph import GradientEdge, Node
 from torch.nn import Parameter
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
-from .device import device_synchronize, record_event, wait_event
+from .device import get_device
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
+
+
+def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
+    """Raise or sleep if a PIPER_FAULT spec matches this execution point.
+
+    pass_name: "bwd" or "upd".
+    iter_count: 0-based run_dag iteration counter (warmup iterations count).
+    dp_rank: this actor's DP rank.
+
+    Spec format: "<pass>:<iter>:<dp_rank>[:sleep:<s>]", comma-separated.
+    """
+    specs = os.environ.get("PIPER_FAULT")
+    if not specs:
+        return
+    for spec in specs.split(","):
+        parts = spec.split(":")
+        if parts[:3] != [pass_name, str(iter_count), str(dp_rank)]:
+            continue
+        # One BWD node per annotated segment — latch to fire once per iteration.
+        key = (spec, iter_count)
+        if key in _FIRED_FAULTS:
+            continue
+        _FIRED_FAULTS.add(key)
+        print(f"PIPER_FAULT firing: {spec}", flush=True)
+        if len(parts) >= 5 and parts[3] == "sleep":
+            time.sleep(float(parts[4]))
+            continue
+        raise RuntimeError(f"injected fault ({spec})")
+
+
+_FIRED_FAULTS: set = set()
 
 
 @dataclass
@@ -456,6 +489,12 @@ class DagExecutor:
     communication: CommunicationExecutor
     compute: ComputeExecutor
     logger: Any
+    # 0-based iteration counter, set by PiperActor.run_dag each call.
+    # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
+    _iter_count: int = 0
+
+    def __post_init__(self):
+        self.dev = get_device()
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
@@ -509,7 +548,7 @@ class DagExecutor:
         compute_stream_ctx = self.runtime.stream_for_task(compute_node)
         for pred in compute_node.data_preds:
             if pred.task_type == TaskType.ALL_GATHER:
-                wait_event(compute_stream_ctx, self.events.all_gather.get(pred.uid))
+                self.dev.wait_event(compute_stream_ctx, self.events.all_gather.get(pred.uid))
 
     def _all_to_all_ep_boundary(
         self,
@@ -552,10 +591,11 @@ class DagExecutor:
         self.params.clear_param_grads()
         default_stream_ctx = self.runtime.default_stream()
         self.params.zero_grad_buffers(default_stream_ctx)
-        zero_evt = record_event(default_stream_ctx)
+        zero_evt = self.dev.record_event(default_stream_ctx)
+        step_result = None
         for stream_ctx in self.runtime.streams.values():
             if stream_ctx is not default_stream_ctx:
-                wait_event(stream_ctx, zero_evt)
+                self.dev.wait_event(stream_ctx, zero_evt)
         comp_events: dict[Any, Any] = {}
 
         self.buffers.init_refcounts(dag)
@@ -583,7 +623,7 @@ class DagExecutor:
             match task_type:
                 case TaskType.SEND:
                     compute_node = node.data_preds[0]
-                    wait_event(node_stream_ctx, comp_events.get(compute_node.uid))
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(compute_node.uid))
                     send_data = self.buffers.task[compute_node.uid]["send_output"]
                     self.communication.send(send_data, node.peer_pp_rank, stream_ctx=node_stream_ctx)
                     send_buf = self.buffers.task.get(compute_node.uid)
@@ -594,7 +634,7 @@ class DagExecutor:
                 case TaskType.RECV:
                     compute_node = node.data_succs[0]
                     comp_evt = last_comp_event_by_stream.get(self.runtime.stream_id(compute_node))
-                    wait_event(node_stream_ctx, comp_evt)
+                    self.dev.wait_event(node_stream_ctx, comp_evt)
                     if compute_node.task_type == TaskType.FWD:
                         recv_ubid = self._node_bucket_key(compute_node)
                         recv_tensors = self.communication.recv_fwd(
@@ -608,11 +648,11 @@ class DagExecutor:
                             shape_meta, node.peer_pp_rank, stream_ctx=node_stream_ctx
                         )
                     self.buffers.task[node.uid] = recv_tensors
-                    self.events.recv[node.uid] = record_event(node_stream_ctx)
+                    self.events.recv[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.FWD_A2A:
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
-                    wait_event(node_stream_ctx, comp_events.get(fwd_pred.uid))
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(fwd_pred.uid))
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
@@ -622,14 +662,14 @@ class DagExecutor:
                     ).requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.buffers.task[node.uid] = fwd_buf
-                    self.events.a2a[node.uid] = record_event(node_stream_ctx)
+                    self.events.a2a[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.BWD_A2A:
                     bwd_pred = next(
                         p for p in node.data_preds
                         if p.task_type in (TaskType.BWD, TaskType.BWD_I)
                     )
-                    wait_event(node_stream_ctx, comp_events.get(bwd_pred.uid))
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_pred.uid))
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     bwd_buf = dict(self.buffers.task[bwd_pred.uid])
                     self.buffers.release(bwd_pred.uid)
@@ -643,7 +683,7 @@ class DagExecutor:
                     )
                     bwd_buf["inp_grads"] = inp_grads
                     self.buffers.task[node.uid] = bwd_buf
-                    self.events.a2a[node.uid] = record_event(node_stream_ctx)
+                    self.events.a2a[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
@@ -651,10 +691,10 @@ class DagExecutor:
                     assert ar_ubids, (
                         f"ALL_REDUCE node uid={node.uid} has no sync_payload_ubids"
                     )
-                    wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
                     for ar_ubid in ar_ubids:
                         self.communication.all_reduce_grads(ar_ubid, stream_ctx=node_stream_ctx)
-                    self.events.all_reduce[node.uid] = record_event(node_stream_ctx)
+                    self.events.all_reduce[node.uid] = self.dev.record_event(node_stream_ctx)
                     self.buffers.release(bwd_node.uid)
 
                 case TaskType.REDUCE_SCATTER:
@@ -663,9 +703,9 @@ class DagExecutor:
                     assert rs_ubid is not None, (
                         f"REDUCE_SCATTER node uid={node.uid} has no bucket_key"
                     )
-                    wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
                     rs_bytes = self.communication.reduce_scatter(rs_ubid, stream_ctx=node_stream_ctx)
-                    rs_evt = record_event(node_stream_ctx)
+                    rs_evt = self.dev.record_event(node_stream_ctx)
                     self.events.reduce_scatter[node.uid] = rs_evt
                     if rs_bytes:
                         self.params.defer_free_full_grads(rs_ubid, rs_evt)
@@ -679,20 +719,20 @@ class DagExecutor:
                         f"ALL_GATHER node uid={node.uid} has no bucket_key"
                     )
                     self.params.all_gather_full_params(ag_ubid, stream_ctx=node_stream_ctx)
-                    self.events.all_gather[node.uid] = record_event(node_stream_ctx)
+                    self.events.all_gather[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.FWD:
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
 
                     a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_data_pred = next(
                         (p for p in node.data_preds
@@ -716,25 +756,26 @@ class DagExecutor:
                         (t.shape, t.dtype) for t in fwd_out["out_with_grad"]
                     ]
                     self.buffers.task[fwd_key] = fwd_out
-                    evt = record_event(node_stream_ctx)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD:
+                    _maybe_inject_fault("bwd", self._iter_count, self.runtime.dp_rank)
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
                     self._wait_for_all_gather(node)
 
                     a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_uid = node.node_meta.get("fwd_uid")
                     fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
@@ -746,6 +787,7 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -815,7 +857,7 @@ class DagExecutor:
                     self.buffers.task[node.uid] = buf
                     fwd_out.clear()
                     del self.buffers.task[fwd_key]
-                    evt = record_event(node_stream_ctx)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
                     self.events.backward[ubid] = evt
@@ -827,7 +869,7 @@ class DagExecutor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
                     self._wait_for_all_gather(node)
 
                     fwd_uid = node.node_meta.get("fwd_uid")
@@ -901,7 +943,7 @@ class DagExecutor:
                     fwd_out.clear()
                     del stage_outputs_or_loss, fwd_out
                     del self.buffers.task[fwd_key]
-                    evt = record_event(node_stream_ctx)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
                     self.events.backward[ubid] = evt
@@ -931,7 +973,7 @@ class DagExecutor:
                     self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream_ctx)
                     self.buffers.task[node.uid] = {}
                     self.buffers.release(bwdi_node.uid)
-                    evt = record_event(node_stream_ctx)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
                     self.events.backward[ubid] = evt
@@ -939,39 +981,42 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(node_stream_ctx, loss_buffer)
+                    step_result = self._update(node_stream_ctx, loss_buffer)
 
                 case TaskType.ORDER_DUMMY:
                     pass
 
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
+        return step_result
 
     def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
+            _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
             self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
-            losses = loss_buffer
+            losses = list(loss_buffer)
             loss_buffer.clear()
-            device_synchronize()
-            return losses
+            self.dev.synchronize()
+            return [float(l) for l in losses]
 
         for ar_evt in self.events.all_reduce.values():
-            wait_event(stream_ctx, ar_evt)
+            self.dev.wait_event(stream_ctx, ar_evt)
 
+        _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
-            wait_event(stream_ctx, self.events.backward.get(ubid))
+            self.dev.wait_event(stream_ctx, self.events.backward.get(ubid))
 
             with stream_ctx:
                 bucket.optimizer.step()
 
-        losses = loss_buffer
+        losses = list(loss_buffer)
         loss_buffer.clear()
 
-        device_synchronize()
+        self.dev.synchronize()
 
         return {
-            "losses": losses,
+            "losses": [float(l) for l in losses],
         }
