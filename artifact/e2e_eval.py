@@ -343,10 +343,17 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
 
     if exp.system == "torchtitan":
         nnode_value, ngpu_value = backend_layout(exp, args.backend)
-        # Every ZeRO level shards the dense region over the full DP degree.
-        # EP needs dp_shard >= ep, and the world is pp * dp.
-        dp_replicate_degree = 1
-        dp_shard_degree = exp.dp
+        # zero0 replicates. Every other level shards the dense region over
+        # the full DP degree. EP needs dp_shard >= ep, so zero0 cannot run
+        # with experts.
+        if exp.zero_level == "zero0":
+            if exp.ep > 1:
+                raise ValueError("TorchTitan cannot replicate the dense region under expert parallelism; zero0 needs ep 1")
+            dp_replicate_degree = exp.dp
+            dp_shard_degree = 1
+        else:
+            dp_replicate_degree = 1
+            dp_shard_degree = exp.dp
         tt_args = [
             "--parallelism.pipeline_parallel_degree", str(exp.pp),
             "--parallelism.expert_parallel_degree", str(exp.ep),
