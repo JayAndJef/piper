@@ -388,7 +388,6 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
         return command
 
     if exp.system == "megatron":
-        dp_megatron = exp.dp // exp.ep if exp.ep > 1 else exp.dp
         command = [
             "/workspace/artifact/scripts/run_megatron.sh",
             "--nnode", nnode,
@@ -398,7 +397,7 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
             "--master-port", "29500",
             "--model", exp.config,
             "--pp", str(exp.pp),
-            "--dp", str(dp_megatron),
+            "--dp", str(exp.dp),
             "--ep", str(exp.ep),
         ]
         if args.nsight:
