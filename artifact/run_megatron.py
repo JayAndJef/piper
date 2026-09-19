@@ -15,7 +15,7 @@ Architecture: Qwen3-30B-A3B MoE
 
 Parallelism notes:
   - EP (expert parallelism) divides the DP ranks for the expert weights only.
-  - Total GPUs = tp * pp * dp * cp. EP must divide dp; it is not a factor of the world size.
+  - Total GPUs = tp * pp * dp * cp. DP must divide evenly by EP.
   - With alltoall dispatcher, EP tokens are exchanged across ep ranks within each dp group.
   - Sequence parallelism (--sp) requires --tp > 1.
 
